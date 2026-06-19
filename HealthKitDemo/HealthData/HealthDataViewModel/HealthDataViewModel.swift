@@ -3,7 +3,6 @@ import Observation
 
 @Observable
 class HealthDataViewModel {
-    var dailyMetrics: [DailyHealthMetric] = []
     var isAuthorized = false
     var authorizationError: String? = nil
     var isLoading = false
@@ -14,6 +13,10 @@ class HealthDataViewModel {
     
     private let dataManager = HealthDataManager()
     private let notificationManager = NotificationManager.shared
+    
+    var dailyMetrics: [DailyHealthMetric] {
+        dataManager.dailyMetrics
+    }
     
     var greeting: String {
         let hour = Calendar.current.component(.hour, from: Date())
@@ -34,8 +37,9 @@ class HealthDataViewModel {
         do {
             try await dataManager.requestAuthorization()
             isAuthorized = true
+            dataManager.startObservingChanges()
+            try await Task.sleep(nanoseconds: 500_000_000)
             await fetchHealthData()
-            setupBackgroundObservation()
         } catch {
             isAuthorized = false
             authorizationError = error.localizedDescription
@@ -49,7 +53,6 @@ class HealthDataViewModel {
         do {
             _ = try await notificationManager.requestAuthorization()
         } catch {
-            // Notifications authorization failure does not block the UI
         }
     }
     
@@ -61,19 +64,10 @@ class HealthDataViewModel {
             return
         }
         
-        do {
-            let data = try await dataManager.fetchLast7DaysData()
-            await MainActor.run {
-                self.dailyMetrics = data
-                
-                let hasNoData = data.allSatisfy { $0.stepCount == nil && $0.restingHeartRate == nil }
-                if hasNoData {
-                    self.showPermissionAlert = true
-                }
-            }
-        } catch {
-            await MainActor.run {
-                self.authorizationError = error.localizedDescription
+        await MainActor.run {
+            let data = dataManager.dailyMetrics
+            let hasNoData = data.allSatisfy { $0.stepCount == nil && $0.restingHeartRate == nil }
+            if hasNoData {
                 self.showPermissionAlert = true
             }
         }
@@ -93,14 +87,6 @@ class HealthDataViewModel {
                 self.showNotificationPermissionAlert = true
             }
             return false
-        }
-    }
-    
-    private func setupBackgroundObservation() {
-        dataManager.startObservingUpdates { [weak self] in
-            Task {
-                await self?.fetchHealthData()
-            }
         }
     }
 }

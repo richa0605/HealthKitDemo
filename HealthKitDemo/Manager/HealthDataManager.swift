@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import Observation
 
 struct DailyHealthMetric: Identifiable, Equatable {
     var id: Date { date }
@@ -14,8 +15,19 @@ enum HealthKitError: Error {
     case queryFailed
 }
 
+@Observable
 class HealthDataManager {
+    var dailyMetrics: [DailyHealthMetric] = []
+    
     private let healthStore = HKHealthStore()
+    private var stepsSamples: [HKQuantitySample] = []
+    private var heartRateSamples: [HKQuantitySample] = []
+    
+    private var stepsAnchor: HKQueryAnchor?
+    private var heartRateAnchor: HKQueryAnchor?
+    
+    private var stepsTask: Task<Void, Never>?
+    private var heartRateTask: Task<Void, Never>?
     
     func requestAuthorization() async throws {
         guard HKHealthStore.isHealthDataAvailable() else {
@@ -30,141 +42,110 @@ class HealthDataManager {
         try await healthStore.requestAuthorization(toShare: [], read: [steps, heartRate])
     }
     
-    func fetchLast7DaysData() async throws -> [DailyHealthMetric] {
-        guard HKHealthStore.isHealthDataAvailable() else {
-            throw HealthKitError.notAvailable
-        }
-        
+    func startObservingChanges() {
+        guard HKHealthStore.isHealthDataAvailable() else { return }
         guard let stepsType = HKQuantityType.quantityType(forIdentifier: .stepCount),
               let heartRateType = HKQuantityType.quantityType(forIdentifier: .restingHeartRate) else {
-            throw HealthKitError.invalidType
+            return
         }
         
         let calendar = Calendar.current
-        let now = Date()
-        let startOfToday = calendar.startOfDay(for: now)
+        let startOfToday = calendar.startOfDay(for: Date())
+        guard let startDate = calendar.date(byAdding: .day, value: -6, to: startOfToday) else { return }
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: nil, options: .strictStartDate)
         
-        guard let startDate = calendar.date(byAdding: .day, value: -6, to: startOfToday) else {
-            throw HealthKitError.queryFailed
+        stepsTask = Task {
+            let descriptor = HKAnchoredObjectQueryDescriptor(
+                predicates: [.sample(type: stepsType, predicate: predicate)],
+                anchor: stepsAnchor
+            )
+            do {
+                for try await update in descriptor.results(for: healthStore) {
+                    await MainActor.run {
+                        self.processStepsChanges(added: update.addedSamples, deleted: update.deletedObjects)
+                        self.stepsAnchor = update.newAnchor
+                        self.updateDailyMetrics()
+                    }
+                }
+            } catch {
+            }
         }
         
-        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: now, options: .strictStartDate)
-        let interval = DateComponents(day: 1)
+        heartRateTask = Task {
+            let descriptor = HKAnchoredObjectQueryDescriptor(
+                predicates: [.sample(type: heartRateType, predicate: predicate)],
+                anchor: heartRateAnchor
+            )
+            do {
+                for try await update in descriptor.results(for: healthStore) {
+                    await MainActor.run {
+                        self.processHeartRateChanges(added: update.addedSamples, deleted: update.deletedObjects)
+                        self.heartRateAnchor = update.newAnchor
+                        self.updateDailyMetrics()
+                    }
+                }
+            } catch {
+            }
+        }
+    }
+    
+    func stopObserving() {
+        stepsTask?.cancel()
+        heartRateTask?.cancel()
+    }
+    
+    @MainActor
+    private func processStepsChanges(added: [HKSample], deleted: [HKDeletedObject]) {
+        if let newSteps = added as? [HKQuantitySample] {
+            let newUUIDs = Set(newSteps.map { $0.uuid })
+            self.stepsSamples.removeAll { newUUIDs.contains($0.uuid) }
+            self.stepsSamples.append(contentsOf: newSteps)
+        }
+        let deletedUUIDs = Set(deleted.map { $0.uuid })
+        if !deletedUUIDs.isEmpty {
+            self.stepsSamples.removeAll { deletedUUIDs.contains($0.uuid) }
+        }
+    }
+    
+    @MainActor
+    private func processHeartRateChanges(added: [HKSample], deleted: [HKDeletedObject]) {
+        if let newHeartRates = added as? [HKQuantitySample] {
+            let newUUIDs = Set(newHeartRates.map { $0.uuid })
+            self.heartRateSamples.removeAll { newUUIDs.contains($0.uuid) }
+            self.heartRateSamples.append(contentsOf: newHeartRates)
+        }
+        let deletedUUIDs = Set(deleted.map { $0.uuid })
+        if !deletedUUIDs.isEmpty {
+            self.heartRateSamples.removeAll { deletedUUIDs.contains($0.uuid) }
+        }
+    }
+    
+    @MainActor
+    private func updateDailyMetrics() {
+        let calendar = Calendar.current
+        let now = Date()
+        let startOfToday = calendar.startOfDay(for: now)
+        guard let startDate = calendar.date(byAdding: .day, value: -6, to: startOfToday) else { return }
         
-        let stepsData = try await fetchSteps(type: stepsType, predicate: predicate, anchor: startOfToday, interval: interval, start: startDate, end: now)
-        let heartRateData = try await fetchHeartRate(type: heartRateType, predicate: predicate, anchor: startOfToday, interval: interval, start: startDate, end: now)
+        self.stepsSamples.removeAll { $0.startDate < startDate }
+        self.heartRateSamples.removeAll { $0.startDate < startDate }
         
         var metrics: [DailyHealthMetric] = []
         for i in 0..<7 {
             if let date = calendar.date(byAdding: .day, value: -i, to: startOfToday) {
                 let normalizedDate = calendar.startOfDay(for: date)
-                let steps = stepsData[normalizedDate]
-                let heart = heartRateData[normalizedDate]
-                metrics.append(DailyHealthMetric(date: normalizedDate, stepCount: steps, restingHeartRate: heart))
+                let endOfDay = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: normalizedDate) ?? normalizedDate
+                
+                let daySteps = stepsSamples.filter { $0.startDate >= normalizedDate && $0.startDate <= endOfDay }
+                let stepCount: Double? = daySteps.isEmpty ? nil : daySteps.reduce(0.0) { $0 + $1.quantity.doubleValue(for: .count()) }
+                
+                let dayHeart = heartRateSamples.filter { $0.startDate >= normalizedDate && $0.startDate <= endOfDay }
+                let restingHeartRate: Double? = dayHeart.isEmpty ? nil : dayHeart.reduce(0.0) { $0 + $1.quantity.doubleValue(for: HKUnit(from: "count/min")) } / Double(dayHeart.count)
+                
+                metrics.append(DailyHealthMetric(date: normalizedDate, stepCount: stepCount, restingHeartRate: restingHeartRate))
             }
         }
         
-        return metrics.reversed()
-    }
-    
-    func startObservingUpdates(onUpdate: @escaping () -> Void) {
-        guard let steps = HKQuantityType.quantityType(forIdentifier: .stepCount),
-              let heartRate = HKQuantityType.quantityType(forIdentifier: .restingHeartRate) else {
-            return
-        }
-        
-        let stepsQuery = HKObserverQuery(sampleType: steps, predicate: nil) { _, completionHandler, error in
-            if error == nil {
-                onUpdate()
-            }
-            completionHandler()
-        }
-        
-        let heartQuery = HKObserverQuery(sampleType: heartRate, predicate: nil) { _, completionHandler, error in
-            if error == nil {
-                onUpdate()
-            }
-            completionHandler()
-        }
-        
-        healthStore.execute(stepsQuery)
-        healthStore.execute(heartQuery)
-        
-        healthStore.enableBackgroundDelivery(for: steps, frequency: .immediate) { _, _ in }
-        healthStore.enableBackgroundDelivery(for: heartRate, frequency: .immediate) { _, _ in }
-    }
-    
-    private func fetchSteps(type: HKQuantityType, predicate: NSPredicate, anchor: Date, interval: DateComponents, start: Date, end: Date) async throws -> [Date: Double] {
-        try await withCheckedThrowingContinuation { continuation in
-            let query = HKStatisticsCollectionQuery(
-                quantityType: type,
-                quantitySamplePredicate: predicate,
-                options: .cumulativeSum,
-                anchorDate: anchor,
-                intervalComponents: interval
-            )
-            
-            query.initialResultsHandler = { _, results, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                
-                var data: [Date: Double] = [:]
-                guard let results = results else {
-                    continuation.resume(returning: data)
-                    return
-                }
-                
-                let calendar = Calendar.current
-                results.enumerateStatistics(from: start, to: end) { statistics, _ in
-                    let dayDate = calendar.startOfDay(for: statistics.startDate)
-                    if let sum = statistics.sumQuantity() {
-                        data[dayDate] = sum.doubleValue(for: .count())
-                    }
-                }
-                
-                continuation.resume(returning: data)
-            }
-            
-            self.healthStore.execute(query)
-        }
-    }
-    
-    private func fetchHeartRate(type: HKQuantityType, predicate: NSPredicate, anchor: Date, interval: DateComponents, start: Date, end: Date) async throws -> [Date: Double] {
-        try await withCheckedThrowingContinuation { continuation in
-            let query = HKStatisticsCollectionQuery(
-                quantityType: type,
-                quantitySamplePredicate: predicate,
-                options: .discreteAverage,
-                anchorDate: anchor,
-                intervalComponents: interval
-            )
-            
-            query.initialResultsHandler = { _, results, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                
-                var data: [Date: Double] = [:]
-                guard let results = results else {
-                    continuation.resume(returning: data)
-                    return
-                }
-                
-                let calendar = Calendar.current
-                results.enumerateStatistics(from: start, to: end) { statistics, _ in
-                    let dayDate = calendar.startOfDay(for: statistics.startDate)
-                    if let average = statistics.averageQuantity() {
-                        data[dayDate] = average.doubleValue(for: HKUnit(from: "count/min"))
-                    }
-                }
-                
-                continuation.resume(returning: data)
-            }
-            
-            self.healthStore.execute(query)
-        }
+        self.dailyMetrics = metrics.reversed()
     }
 }

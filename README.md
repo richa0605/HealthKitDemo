@@ -26,14 +26,15 @@ A SwiftUI iOS application demonstrating HealthKit integration, daily symptom log
 ## Key Implementation Decisions
 
 - **MVVM Architecture & Swift Observation**:
-  - The view model uses Swift’s `@Observable` macro to notify the view of state changes. This is standard in iOS 17+, removing the boilerplate associated with `@Published` and `@StateObject`.
+  - The view model uses Swift’s `@Observable` macro to notify the view of state changes.
   - The data retrieval logic and notification logic are completely separated from the UI layer into `HealthDataManager` and `NotificationManager`.
 
-- **Aggregate Data Queries (`HKStatisticsCollectionQuery`)**:
-  - Used `HKStatisticsCollectionQuery` as required to aggregate step counts (`.cumulativeSum`) and resting heart rates (`.discreteAverage`) over 1-day intervals. This avoids querying raw samples and performs calculations directly on the HealthKit store.
-
-- **Reactive Updates & Background Delivery**:
-  - Implemented `HKObserverQuery` and `enableBackgroundDelivery(for:frequency:completion:)` in `HealthDataManager` to receive background updates from HealthKit. When new health data is synchronized, the manager notifies the view model to automatically refresh the dashboard.
+- **Real-Time Incremental Sync (`HKAnchoredObjectQueryDescriptor`)**:
+  - Replaced the initial static query model with `HKAnchoredObjectQueryDescriptor` which streams real-time additions and deletions as an async sequence.
+  - Keeps in-memory caches of step count and resting heart rate samples, appending and subtracting deltas dynamically as they are synced.
+  - Performs local calculations (sum for step counts, average for resting heart rate) to update the daily dashboard.
+  - Optimizes system battery and network calls by only requesting updated or new samples since the last recorded query anchor.
+  - Automatically garbage-collects cached samples that fall outside the rolling 7-day calendar window.
 
 ---
 
@@ -53,10 +54,8 @@ A SwiftUI iOS application demonstrating HealthKit integration, daily symptom log
 ## What I Would Improve With More Time
 
 1. **Unit Testing Coverage**:
-   - Add unit tests for the data managers and view model logic using `XCTest` or Swift Testing. Mock the HealthKit store to simulate success and authorization error conditions.
-2. **Expanded Health Metrics**:
-   - Integrate more metrics like Active Energy Burned, Sleep Analysis, and Water Intake.
-3. **Dynamic Cycle Phase Tracking**:
+   - Add unit tests for the anchored query manager and local calculations using the Swift Testing framework.
+2. **Dynamic Cycle Phase Tracking**:
    - Replace the hardcoded cycle phase string with a functional calculator based on user-logged period logs or ovulation tracking.
-4. **Enhanced Data Synchronization Caching**:
-   - Implement local persistence (CoreData/SwiftData) to cache the latest metrics and show them immediately while loading or when HealthKit permissions are temporarily restricted.
+3. **CoreData Cache Persistence**:
+   - Persist query anchors and cached samples to local storage so the dashboard renders instantly on cold start before new incremental syncs complete.
